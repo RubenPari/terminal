@@ -91,7 +91,10 @@ namespace clipboard
         bool _open = false;
     };
 
-    ClipboardHandle open(HWND hwnd)
+    // `retry` sleeps between attempts. That is only safe off the UI thread:
+    // a holder that then calls EmptyClipboard() sends WM_DESTROYCLIPBOARD to
+    // us and waits. Sleeping through it deadlocks both sides for ~10s (GH#20819).
+    ClipboardHandle open(HWND hwnd, bool retry = true)
     {
         // Turns out, OpenClipboard/CloseClipboard are not thread-safe whatsoever,
         // and on CloseClipboard, the GetClipboardData handle may get freed.
@@ -110,12 +113,15 @@ namespace clipboard
                 success = true;
                 break;
             }
-            // 10 iterations
-            if (sleep > 10000)
+            // 10 iterations. The lock is dropped across the sleep so a
+            // non-blocking caller is not stuck behind this wait.
+            if (!retry || sleep > 10000)
             {
                 break;
             }
+            ReleaseSRWLockExclusive(&lock);
             Sleep(sleep);
+            AcquireSRWLockExclusive(&lock);
         }
 
         if (!success)
@@ -213,6 +219,103 @@ namespace clipboard
         }
 
         return {};
+    }
+
+    bool tryWriteOnce(HWND hwnd, wil::zwstring_view text, std::string_view html, std::string_view rtf)
+    {
+        if (const auto clipboard = open(hwnd, false))
+        {
+            write(text, html, rtf);
+            return true;
+        }
+        return false;
+    }
+
+    // Tries once. If the clipboard is busy, retries from the UI dispatcher so
+    // WM_DESTROYCLIPBOARD can be processed between attempts (GH#20819).
+    // A newer write replaces a pending one. Gives up after about a second.
+    void writeWhenFree(HWND hwnd, std::wstring text, std::string html, std::string rtf)
+    {
+        static constexpr auto retryInterval = std::chrono::milliseconds{ 50 };
+        static constexpr int retryAttempts = 20;
+
+        struct PendingWrite
+        {
+            HWND hwnd{};
+            std::wstring text;
+            std::string html;
+            std::string rtf;
+            int attempts = 0;
+            winrt::Windows::UI::Xaml::DispatcherTimer timer{ nullptr };
+            winrt::event_token token{};
+
+            void stop()
+            {
+                if (!timer)
+                {
+                    return;
+                }
+                timer.Stop();
+                if (token)
+                {
+                    timer.Tick(token);
+                    token = {};
+                }
+            }
+        };
+
+        static std::shared_ptr<PendingWrite> pending;
+
+        if (tryWriteOnce(hwnd, text, html, rtf))
+        {
+            if (pending)
+            {
+                pending->stop();
+                pending.reset();
+            }
+            return;
+        }
+
+        if (!pending)
+        {
+            pending = std::make_shared<PendingWrite>();
+            pending->timer = winrt::Windows::UI::Xaml::DispatcherTimer{};
+            pending->timer.Interval(retryInterval);
+            pending->token = pending->timer.Tick([](auto&&, auto&&) {
+                const auto current = pending;
+                if (!current)
+                {
+                    return;
+                }
+
+                auto done = false;
+                try
+                {
+                    done = tryWriteOnce(current->hwnd, current->text, current->html, current->rtf);
+                }
+                CATCH_LOG();
+
+                current->attempts++;
+                if (done || current->attempts >= retryAttempts)
+                {
+                    if (pending == current)
+                    {
+                        current->stop();
+                        pending.reset();
+                    }
+                }
+            });
+        }
+
+        pending->hwnd = hwnd;
+        pending->text = std::move(text);
+        pending->html = std::move(html);
+        pending->rtf = std::move(rtf);
+        pending->attempts = 0;
+        if (!pending->timer.IsEnabled())
+        {
+            pending->timer.Start();
+        }
     }
 } // namespace clipboard
 
@@ -3690,19 +3793,29 @@ namespace winrt::TerminalApp::implementation
         // and immediately deadlock. *Tada* 5s app freeze.
         //
         // Solution: Just do it on the UI thread. Just like conhost.
+        //
+        // GH#20819: but do not Sleep there. OpenClipboard's backoff used to run
+        // on this thread, so a holder calling EmptyClipboard() (which waits on
+        // our WM_DESTROYCLIPBOARD) froze the window for the full retry.
         co_await wil::resume_foreground(Dispatcher());
 
-        if (const auto clipboard = clipboard::open(_hostingHwnd.value_or(nullptr)))
-        {
-            const auto plain = args.Plain();
-            const auto html = args.Html();
-            const auto rtf = args.Rtf();
+        const auto plain = args.Plain();
+        const auto html = args.Html();
+        const auto rtf = args.Rtf();
 
-            clipboard::write(
-                { plain.data(), plain.size() },
-                { reinterpret_cast<const char*>(html.data()), html.size() },
-                { reinterpret_cast<const char*>(rtf.data()), rtf.size() });
+        std::wstring text{ plain.c_str(), plain.size() };
+        std::string htmlBytes;
+        std::string rtfBytes;
+        if (html.size())
+        {
+            htmlBytes.assign(reinterpret_cast<const char*>(html.data()), html.size());
         }
+        if (rtf.size())
+        {
+            rtfBytes.assign(reinterpret_cast<const char*>(rtf.data()), rtf.size());
+        }
+
+        clipboard::writeWhenFree(_hostingHwnd.value_or(nullptr), std::move(text), std::move(htmlBytes), std::move(rtfBytes));
     }
 
     // Method Description:
